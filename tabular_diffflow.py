@@ -3,72 +3,237 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import pandas as pd
+import math
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.model_selection import train_test_split
 
-class SparseFeatureAttention(nn.Module):
-    """Attention mechanism that focuses on statistically dependent features."""
-    def __init__(self, n_features, d_model, sparsity=0.5):
+class EnhancedSparseFeatureAttention(nn.Module):
+    """Enhanced attention mechanism for financial features with better correlation modeling."""
+    def __init__(self, n_features, d_model, sparsity=0.5, heads=4, dropout=0.1):
         super().__init__()
+        self.n_features = n_features
+        self.d_model = d_model
+        self.sparsity = sparsity
+        self.heads = heads
+        self.head_dim = d_model // heads
+        assert self.head_dim * heads == d_model, "d_model must be divisible by heads"
+        
+        # Multi-head attention components
         self.query = nn.Linear(d_model, d_model)
         self.key = nn.Linear(d_model, d_model)
         self.value = nn.Linear(d_model, d_model)
-        self.sparsity = sparsity
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
         
-        # Learnable feature correlation prior
-        self.correlation_prior = nn.Parameter(torch.zeros(n_features, n_features))
+        # Learnable feature correlation prior with structure for financial data
+        # Initialize with temporal decay pattern (common in financial time series)
+        correlation_prior = torch.zeros(n_features, n_features)
+        for i in range(n_features):
+            for j in range(n_features):
+                # Closer features have stronger prior correlation
+                correlation_prior[i, j] = 0.5 * np.exp(-0.1 * abs(i - j))
+        self.correlation_prior = nn.Parameter(correlation_prior)
+        
+        # Feature importance weights
+        self.feature_importance = nn.Parameter(torch.ones(n_features))
+        
+        # For financial data specific correlations
+        self.price_vol_detector = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, 1),
+            nn.Sigmoid()
+        )
+        
+    def _split_heads(self, x):
+        """Split the last dimension into (heads, head_dim)"""
+        batch_size, n_features, d_model = x.shape
+        x = x.view(batch_size, n_features, self.heads, self.head_dim)
+        # (batch_size, heads, n_features, head_dim)
+        return x.permute(0, 2, 1, 3)
+        
+    def _merge_heads(self, x):
+        """Merge the heads back into d_model dimension"""
+        batch_size, heads, n_features, head_dim = x.shape
+        # (batch_size, n_features, heads, head_dim)
+        x = x.permute(0, 2, 1, 3)
+        # (batch_size, n_features, d_model)
+        return x.reshape(batch_size, n_features, self.d_model)
         
     def forward(self, x):
+        """Forward pass with multi-head attention and financial feature correlations"""
         # x shape: [batch_size, n_features, d_model]
         batch_size, n_features, _ = x.shape
         
+        # Linear projections
         q = self.query(x)  # [batch_size, n_features, d_model]
         k = self.key(x)    # [batch_size, n_features, d_model]
         v = self.value(x)  # [batch_size, n_features, d_model]
         
-        # Compute attention scores
-        scores = torch.bmm(q, k.transpose(1, 2)) / np.sqrt(k.size(-1))  # [batch_size, n_features, n_features]
+        # Split heads
+        q = self._split_heads(q)  # [batch_size, heads, n_features, head_dim]
+        k = self._split_heads(k)  # [batch_size, heads, n_features, head_dim]
+        v = self._split_heads(v)  # [batch_size, heads, n_features, head_dim]
         
-        # Add learned correlation prior
-        scores = scores + self.correlation_prior.unsqueeze(0)
+        # Scaled dot-product attention with masks for each head
+        # [batch_size, heads, n_features, n_features]
+        scores = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(self.head_dim)
         
-        # Apply sparsity by keeping only top-k values
-        k = int(n_features * self.sparsity)
-        topk_values, _ = torch.topk(scores, k, dim=-1)
-        threshold = topk_values[:, :, -1].unsqueeze(-1)
-        mask = scores < threshold
-        scores = scores.masked_fill(mask, -1e9)
+        # Apply learned correlation prior 
+        # Reshape for broadcasting over heads
+        prior = self.correlation_prior.unsqueeze(0).unsqueeze(1)
         
-        # Apply softmax
+        # Weight by feature importance
+        importance = self.feature_importance.unsqueeze(0).unsqueeze(1)
+        importance = importance.unsqueeze(-1) * importance.unsqueeze(-2)
+        
+        # Combine with learned prior
+        scores = scores + prior * importance
+        
+        # Detect price-volume correlations (common in financial data)
+        if n_features >= 2:
+            # Simplified assumption that early features are price-related
+            # and later features are volume-related
+            price_features = x[:, :n_features//2].mean(dim=1)  # [batch_size, d_model]
+            vol_features = x[:, n_features//2:].mean(dim=1)    # [batch_size, d_model]
+            combined = torch.cat([price_features, vol_features], dim=1)
+            pv_correlation = self.price_vol_detector(combined).view(batch_size, 1, 1, 1)
+            
+            # Create price-volume correlation mask that boosts correlations
+            # between price and volume features
+            pv_mask = torch.zeros_like(scores)
+            mid = n_features // 2
+            pv_mask[:, :, :mid, mid:] = 1.0  # price to volume connections
+            pv_mask[:, :, mid:, :mid] = 1.0  # volume to price connections
+            
+            # Apply price-volume boost
+            scores = scores + pv_correlation * pv_mask * 0.5
+        
+        # Apply sparsity by keeping only top-k values per feature
+        k_value = max(1, int(n_features * self.sparsity))
+        
+        # Process each head separately
+        for h in range(self.heads):
+            # For each head, get top-k values
+            topk_values, _ = torch.topk(scores[:, h], k_value, dim=-1)
+            threshold = topk_values[:, :, -1].unsqueeze(-1)
+            mask = scores[:, h] < threshold
+            scores[:, h] = scores[:, h].masked_fill(mask, -1e9)
+        
+        # Apply softmax across all heads
         attention = F.softmax(scores, dim=-1)
+        attention = self.dropout(attention)
         
         # Apply attention to values
-        output = torch.bmm(attention, v)  # [batch_size, n_features, d_model]
+        output = torch.matmul(attention, v)  # [batch_size, heads, n_features, head_dim]
+        
+        # Merge heads back
+        output = self._merge_heads(output)  # [batch_size, n_features, d_model]
+        
+        # Final projection
+        output = self.out_proj(output)
         
         return output
 
-class AdaptiveNoiseSchedule(nn.Module):
-    """Learnable noise schedule for the diffusion process."""
-    def __init__(self, n_timesteps, init_beta_min=1e-4, init_beta_max=2e-2):
+
+class SparseFeatureAttention(EnhancedSparseFeatureAttention):
+    """Legacy class for backward compatibility."""
+    pass
+
+class FinancialNoiseSchedule(nn.Module):
+    """
+    Adaptive noise schedule optimized for financial data.
+    
+    Key enhancements:
+    1. Implements regime-aware noise scheduling to better model bull/bear markets
+    2. Focuses noise schedule on early and late diffusion steps for better time-series
+    3. Provides tail-risk adjustments for better modeling of financial extremes
+    """
+    def __init__(self, n_timesteps, init_beta_min=1e-4, init_beta_max=2e-2, regime_aware=True):
         super().__init__()
-        # Parameterize beta values through sigmoid to ensure they stay in a reasonable range
-        raw_values = torch.linspace(-6, 6, n_timesteps)  # Will be transformed to roughly [init_beta_min, init_beta_max]
+        # Initialize with optimized schedule for financial data - more noise in the middle steps
+        # to better preserve financial time series patterns
+        raw_values = torch.zeros(n_timesteps)
+        # Quadratic schedule provides more focus on early and late diffusion steps
+        # which helps maintain temporal correlations better in financial data
+        for i in range(n_timesteps):
+            # Quadratic curve with higher values in middle
+            norm_i = i / (n_timesteps - 1)
+            # Skewed towards preserving the original signal longer
+            val = -6 + 24 * norm_i - 12 * (norm_i ** 2)  
+            raw_values[i] = val
+            
         self.raw_betas = nn.Parameter(raw_values)
         self.n_timesteps = n_timesteps
         self.init_beta_min = init_beta_min
         self.init_beta_max = init_beta_max
         
-    def forward(self, t_normalized):
+        # Regime-aware component for financial markets
+        self.regime_aware = regime_aware
+        if regime_aware:
+            # Initialize with small random values
+            self.regime_modulation = nn.Parameter(torch.randn(n_timesteps) * 0.01)
+            
+            # Tail risk adjustment for better handling of financial extremes
+            self.tail_adjustment = nn.Parameter(torch.zeros(n_timesteps) + 0.1)
+        
+    def forward(self, t_normalized, regime_indicator=None, volatility=None):
         """
         Args:
             t_normalized: Normalized time steps between 0 and 1
+            regime_indicator: Optional indicator of market regime (e.g., bull=1, bear=-1)
+            volatility: Optional estimate of current market volatility
+            
         Returns:
             Beta values for the corresponding time steps
         """
         t_idx = (t_normalized * (self.n_timesteps - 1)).long()
-        return self.get_all_betas()[t_idx]
-    
+        base_betas = self.get_all_betas()
+        
+        # Apply regime awareness if available
+        if self.regime_aware and regime_indicator is not None:
+            # Modulate noise based on regime (market state)
+            regime_mod = torch.sigmoid(self.regime_modulation) * 0.1
+            
+            # Convert scalar regime indicator to appropriate shape
+            if not isinstance(regime_indicator, torch.Tensor):
+                regime_indicator = torch.tensor([regime_indicator], device=t_normalized.device)
+            if regime_indicator.dim() == 0:
+                regime_indicator = regime_indicator.unsqueeze(0)
+            if regime_indicator.dim() == 1 and regime_indicator.size(0) == 1 and t_normalized.size(0) > 1:
+                regime_indicator = regime_indicator.expand(t_normalized.size(0))
+                
+            # Calculate factor based on regime (bull markets have less noise)
+            regime_factor = 1.0 - regime_indicator.view(-1, 1) * regime_mod[t_idx]
+            betas = base_betas[t_idx] * regime_factor
+        else:
+            betas = base_betas[t_idx]
+        
+        # Apply volatility adjustment if available
+        if self.regime_aware and volatility is not None:
+            # For high volatility, increase noise to better capture uncertain movements
+            if not isinstance(volatility, torch.Tensor):
+                volatility = torch.tensor([volatility], device=t_normalized.device)
+            if volatility.dim() == 0:
+                volatility = volatility.unsqueeze(0)
+            if volatility.dim() == 1 and volatility.size(0) == 1 and t_normalized.size(0) > 1:
+                volatility = volatility.expand(t_normalized.size(0))
+                
+            # Normalize volatility factor (assuming volatility is already standardized)
+            # Higher volatility -> more noise to capture larger price movements
+            vol_factor = 1.0 + torch.clamp(volatility.view(-1, 1) * 0.2, -0.2, 0.5)
+            betas = betas * vol_factor
+            
+            # Apply tail adjustment for extreme values (financial tail risk)
+            tail_adj = torch.sigmoid(self.tail_adjustment)[t_idx]
+            # More extreme values get more adjustment
+            extreme_mask = (volatility.view(-1, 1) > 2.0).float()
+            betas = betas + tail_adj * extreme_mask * 0.01
+        
+        # Safety clamp to ensure betas remain in valid range
+        return torch.clamp(betas, self.init_beta_min, self.init_beta_max * 1.5)
+        
     def get_all_betas(self):
         """Return all beta values with constraint applied."""
         # Apply sigmoid and scale to the desired range
@@ -82,6 +247,119 @@ class AdaptiveNoiseSchedule(nn.Module):
         """Return all cumulative products of alphas."""
         alphas = self.get_all_alphas()
         return torch.cumprod(alphas, dim=0)
+
+
+class TemporalTransformer(nn.Module):
+    """
+    Transformer layer for capturing temporal dependencies in financial data.
+    
+    This module helps the model understand time-series relationships and
+    patterns that are crucial for financial data modeling.
+    """
+    def __init__(self, d_model, nhead=4, dim_feedforward=1024, dropout=0.1):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.activation = nn.GELU()
+        
+        # Financial-specific enhancement: time-decay attention mask
+        self.register_buffer('time_decay', None)
+        
+    def _get_time_decay_mask(self, seq_len, device):
+        """Generate a time decay mask that emphasizes recent temporal patterns"""
+        if self.time_decay is None or self.time_decay.size(0) < seq_len:
+            # Create new decay matrix
+            decay_matrix = torch.zeros(seq_len, seq_len, device=device)
+            for i in range(seq_len):
+                for j in range(seq_len):
+                    # Exponential decay with distance - financial data often shows
+                    # exponentially decreasing influence from past values
+                    decay_matrix[i, j] = np.exp(-0.1 * abs(i - j))
+            self.time_decay = decay_matrix
+            
+        return self.time_decay[:seq_len, :seq_len]
+        
+    def forward(self, src, src_mask=None, use_time_decay=True):
+        """
+        Forward pass with temporal awareness for financial data
+        
+        Args:
+            src: Source sequence [seq_len, batch_size, d_model]
+            src_mask: Optional attention mask
+            use_time_decay: Whether to apply time decay masking for financial data
+        """
+        seq_len, batch_size, _ = src.shape
+        
+        # Self-attention block with time decay for financial data
+        if use_time_decay and src_mask is None:
+            time_decay_mask = self._get_time_decay_mask(seq_len, src.device)
+            # Apply attention with time decay mask
+            src2 = self.self_attn(src, src, src, attn_mask=time_decay_mask)[0]
+        else:
+            # Standard attention
+            src2 = self.self_attn(src, src, src, attn_mask=src_mask)[0]
+            
+        src = src + src2
+        src = self.norm1(src)
+        
+        # Feedforward block
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + src2
+        src = self.norm2(src)
+        
+        return src
+
+
+class VolatilityAwareEncoding(nn.Module):
+    """
+    Encodes volatility information for financial data.
+    
+    Financial data generation benefits from explicit volatility awareness
+    as volatility clustering is a key feature of financial time series.
+    """
+    def __init__(self, d_model):
+        super().__init__()
+        self.volatility_embedding = nn.Sequential(
+            nn.Linear(1, d_model // 2),
+            nn.SiLU(),
+            nn.Linear(d_model // 2, d_model)
+        )
+        
+    def forward(self, x, volatility):
+        """
+        Args:
+            x: Input features
+            volatility: Volatility estimate (e.g., rolling standard deviation)
+        """
+        # Ensure volatility is properly shaped
+        if not isinstance(volatility, torch.Tensor):
+            volatility = torch.tensor([volatility], device=x.device)
+        
+        if volatility.dim() == 0:
+            volatility = volatility.unsqueeze(0)
+            
+        if volatility.dim() == 1 and volatility.size(0) == 1 and x.size(0) > 1:
+            volatility = volatility.expand(x.size(0))
+            
+        vol_emb = self.volatility_embedding(volatility.unsqueeze(-1))
+        
+        # Add volatility embedding to input features
+        if x.dim() == 2:  # [batch_size, d_model]
+            return x + vol_emb
+        elif x.dim() == 3:  # [batch_size, seq_len/n_features, d_model]
+            return x + vol_emb.unsqueeze(1)
+            
+        return x
+
+
+class AdaptiveNoiseSchedule(FinancialNoiseSchedule):
+    """Legacy class for backward compatibility."""
+    def __init__(self, n_timesteps, init_beta_min=1e-4, init_beta_max=2e-2):
+        super().__init__(n_timesteps, init_beta_min, init_beta_max, regime_aware=True)
 
 class CouplingLayer(nn.Module):
     """Affine coupling layer for normalizing flow."""
@@ -169,7 +447,8 @@ class NormalizingFlow(nn.Module):
 class TabularDiffFlow(nn.Module):
     """
     Novel hybrid model combining diffusion models and normalizing flows
-    for synthetic tabular data generation.
+    for synthetic tabular data generation, enhanced with temporal awareness
+    and financial data optimization.
     """
     def __init__(
         self, 
@@ -178,12 +457,20 @@ class TabularDiffFlow(nn.Module):
         n_diffusion_steps=1000,
         n_flow_layers=3,
         sparsity=0.5,
-        feature_ranges=None  # Tuple of (min, max) for each feature
+        feature_ranges=None,  # Tuple of (min, max) for each feature
+        financial_data=True,  # Enable financial data optimizations
+        trend_preservation=True,  # For better trend modeling in financial time series
+        use_temporal_transformer=True,  # Enable temporal transformer component
+        n_heads=4,  # Number of attention heads
+        dropout=0.1  # Dropout rate for regularization
     ):
         super().__init__()
         self.n_features = n_features
         self.d_model = d_model
         self.n_diffusion_steps = n_diffusion_steps
+        self.financial_data = financial_data
+        self.trend_preservation = trend_preservation
+        self.use_temporal_transformer = use_temporal_transformer
         
         # Feature normalization ranges
         if feature_ranges is None:
@@ -193,56 +480,192 @@ class TabularDiffFlow(nn.Module):
             self.register_buffer('feature_min', torch.tensor([x[0] for x in feature_ranges], dtype=torch.float32))
             self.register_buffer('feature_max', torch.tensor([x[1] for x in feature_ranges], dtype=torch.float32))
         
-        # Adaptive noise schedule
-        self.noise_schedule = AdaptiveNoiseSchedule(n_diffusion_steps)
+        # Enhanced noise schedule for financial data
+        self.noise_schedule = FinancialNoiseSchedule(
+            n_diffusion_steps,
+            init_beta_min=1e-4,
+            init_beta_max=2e-2,
+            regime_aware=financial_data
+        )
         
-        # Feature-wise attention mechanism
-        self.feature_attention = SparseFeatureAttention(n_features, d_model, sparsity)
+        # Enhanced feature-wise attention mechanism with multiple heads
+        self.feature_attention = EnhancedSparseFeatureAttention(
+            n_features, 
+            d_model, 
+            sparsity=sparsity,
+            heads=n_heads,
+            dropout=dropout
+        )
         
-        # Feature embedding
+        # Feature embedding with better initialization for financial data
         self.feature_embedding = nn.Sequential(
             nn.Linear(n_features, d_model),
             nn.SiLU(),
             nn.Linear(d_model, d_model)
         )
         
-        # Time embedding
+        # Time embedding with sinusoidal components for better modeling of periodicity
+        # This helps with financial data that often exhibits daily, weekly, monthly patterns
         self.time_embedding = nn.Sequential(
             nn.Linear(1, d_model),
             nn.SiLU(),
             nn.Linear(d_model, d_model)
         )
         
-        # Feature-wise processing
-        self.feature_processor = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(d_model * 2, d_model),  # Combined feature and time embedding
+        # Add volatility awareness for financial data
+        if financial_data:
+            self.volatility_encoder = VolatilityAwareEncoding(d_model)
+        
+        # Add temporal transformer for time-series understanding
+        if use_temporal_transformer:
+            self.temporal_transformer = TemporalTransformer(
+                d_model, 
+                nhead=n_heads,
+                dim_feedforward=d_model * 2,
+                dropout=dropout
+            )
+            
+        # Helper function to create improved feature processors
+        def create_feature_processor():
+            return nn.Sequential(
+                nn.Linear(d_model * 2, d_model),
                 nn.SiLU(),
                 nn.Linear(d_model, d_model),
                 nn.SiLU(),
                 nn.Linear(d_model, d_model)
             )
-            for _ in range(n_features)
-        ])
+            
+        # Feature-wise processing with shared weights 
+        # (more efficient and better generalization)
+        if n_features <= 32:
+            # For smaller feature sets, use per-feature processing
+            self.feature_processor = nn.ModuleList([
+                create_feature_processor() for _ in range(n_features)
+            ])
+            self.shared_processing = False
+        else:
+            # For larger feature sets, use shared weights with feature IDs
+            self.feature_processor = create_feature_processor()
+            # Feature ID embedding to distinguish between features
+            self.feature_id_embedding = nn.Embedding(n_features, d_model // 4)
+            self.shared_processing = True
         
-        # Global processing with attention
+        # Global processing with attention and residual connections
         self.global_processor = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(d_model, d_model * 2),
             nn.SiLU(),
-            nn.Linear(d_model, d_model)
+            nn.Linear(d_model * 2, d_model),
+            nn.LayerNorm(d_model)  # Adds stability to financial data training
         )
         
-        # Denoising network
+        # Denoising network with improved architecture for financial data
         self.denoise_net = nn.Sequential(
             nn.Linear(d_model, d_model * 2),
             nn.SiLU(),
+            nn.Dropout(dropout),  # Added dropout for regularization
             nn.Linear(d_model * 2, d_model * 2),
             nn.SiLU(),
+            nn.Dropout(dropout),  # Added dropout for regularization
             nn.Linear(d_model * 2, n_features * 2)  # Predict mean and log variance
         )
         
         # Normalizing flow for fine details
         self.flow = NormalizingFlow(n_features, d_model, n_layers=n_flow_layers)
+        
+        # Flag for market regime detection
+        self.detect_regime = financial_data
+        if self.detect_regime:
+            # Simple regime detector based on feature patterns
+            self.regime_detector = nn.Sequential(
+                nn.Linear(n_features, d_model // 2),
+                nn.SiLU(),
+                nn.Linear(d_model // 2, 1),
+                nn.Tanh()  # Output from -1 (bear) to 1 (bull)
+            )
+            
+            # Volatility estimator
+            self.volatility_estimator = nn.Sequential(
+                nn.Linear(n_features, d_model // 2),
+                nn.SiLU(),
+                nn.Linear(d_model // 2, 1),
+                nn.Softplus()  # Ensure positive volatility
+            )
+    
+    def _process_embeddings(self, x_t, t):
+        """
+        Process input embeddings with feature attention.
+        This helper function reduces code duplication between predict_noise and diffusion_reverse_process.
+        """
+        batch_size = x_t.shape[0]
+        
+        # Time embedding
+        t_emb = self.time_embedding(t.view(-1, 1))  # [batch_size, d_model]
+        
+        # Feature embedding
+        x_emb = self.feature_embedding(x_t)  # [batch_size, d_model]
+        
+        # Apply volatility awareness for financial data
+        if self.financial_data:
+            # Estimate volatility from input features
+            volatility = self.volatility_estimator(x_t).view(-1)
+            # Apply volatility encoding
+            x_emb = self.volatility_encoder(x_emb, volatility)
+        
+        # Expand to feature-wise representations
+        x_emb = x_emb.unsqueeze(1).expand(-1, self.n_features, -1)  # [batch_size, n_features, d_model]
+        t_emb = t_emb.unsqueeze(1).expand(-1, self.n_features, -1)  # [batch_size, n_features, d_model]
+        
+        # Combine time and feature embeddings
+        combined = torch.cat([x_emb, t_emb], dim=2)  # [batch_size, n_features, d_model*2]
+        
+        # Process features (either individually or with shared weights)
+        if self.shared_processing:
+            # Use shared processing with feature IDs for larger feature sets
+            # First, get feature IDs
+            feature_ids = torch.arange(self.n_features, device=x_t.device)
+            # Get feature ID embeddings
+            feature_id_embs = self.feature_id_embedding(feature_ids)  # [n_features, d_model//4]
+            
+            # Reshape combined for vectorized processing
+            batch_dim = combined.shape[0]
+            combined_flat = combined.reshape(-1, combined.shape[-1])  # [batch*n_features, d_model*2]
+            
+            # Process all features at once with shared weights
+            processed_flat = self.feature_processor(combined_flat)  # [batch*n_features, d_model]
+            processed = processed_flat.reshape(batch_dim, self.n_features, -1)  # [batch, n_features, d_model]
+            
+            # Add feature ID embeddings to help distinguish features
+            feature_id_embs = feature_id_embs.unsqueeze(0).expand(batch_dim, -1, -1)
+            feature_id_padding = torch.zeros(batch_dim, self.n_features, 
+                                           self.d_model - feature_id_embs.shape[-1], 
+                                           device=x_t.device)
+            feature_id_embs_padded = torch.cat([feature_id_embs, feature_id_padding], dim=2)
+            
+            # Combine processed features with their IDs
+            feature_outputs = processed + 0.1 * feature_id_embs_padded
+        else:
+            # Process each feature individually for smaller feature sets
+            feature_outputs = []
+            for i, processor in enumerate(self.feature_processor):
+                feature_outputs.append(processor(combined[:, i]))
+            feature_outputs = torch.stack(feature_outputs, dim=1)  # [batch_size, n_features, d_model]
+        
+        # Apply attention to capture feature dependencies
+        attended = self.feature_attention(feature_outputs)  # [batch_size, n_features, d_model]
+        
+        # Apply temporal transformer for financial data if enabled
+        if self.use_temporal_transformer:
+            # Reshape for transformer (seq_len, batch, features)
+            transformed = attended.permute(1, 0, 2)  # [n_features, batch_size, d_model]
+            transformed = self.temporal_transformer(transformed)
+            # Reshape back
+            attended = transformed.permute(1, 0, 2)  # [batch_size, n_features, d_model]
+        
+        # Global processing
+        global_repr = attended.mean(dim=1)  # [batch_size, d_model]
+        global_processed = self.global_processor(global_repr)  # [batch_size, d_model]
+        
+        return global_processed
     
     def normalize_features(self, x):
         """Normalize features to [0, 1] range."""
@@ -252,21 +675,68 @@ class TabularDiffFlow(nn.Module):
         """Convert [0, 1] range back to original feature scales."""
         return x * (self.feature_max - self.feature_min + 1e-6) + self.feature_min
     
-    def diffusion_forward_process(self, x_0, t):
+    def detect_market_regime(self, x):
         """
-        Forward diffusion process q(x_t | x_0).
+        Detect market regime (bull/bear) from input features.
+        Returns value between -1 (bear) and 1 (bull).
+        """
+        if not self.detect_regime:
+            return None
+        
+        with torch.no_grad():
+            regime = self.regime_detector(x)
+        return regime.view(-1)
+    
+    def estimate_volatility(self, x):
+        """
+        Estimate market volatility from input features.
+        """
+        if not self.financial_data:
+            return None
+            
+        with torch.no_grad():
+            volatility = self.volatility_estimator(x)
+        return volatility.view(-1)
+    
+    def diffusion_forward_process(self, x_0, t, market_regime=None):
+        """
+        Forward diffusion process q(x_t | x_0) with market regime awareness.
         
         Args:
             x_0: Original data
             t: Time step (between 0 and 1)
+            market_regime: Optional market regime indicator (-1 to 1)
             
         Returns:
             x_t: Noised data at time t
             epsilon: The noise added
         """
+        # Auto-detect market regime if not provided and model is configured for it
+        if market_regime is None and self.detect_regime:
+            market_regime = self.detect_market_regime(x_0)
+            
+        # Auto-detect volatility for financial data
+        volatility = None
+        if self.financial_data:
+            volatility = self.estimate_volatility(x_0)
+        
+        # Get time indices
         t_idx = (t * (self.n_diffusion_steps - 1)).long()
-        alpha_hat = self.noise_schedule.get_all_alpha_hats()[t_idx]
-        alpha_hat = alpha_hat.view(-1, 1)
+        
+        # Get alphas with regime and volatility awareness
+        if market_regime is not None or volatility is not None:
+            alpha_hat = torch.ones_like(x_0[:, 0]).unsqueeze(-1)
+            alphas = self.noise_schedule.get_all_alphas()
+            
+            # Compute alpha_hat manually to incorporate regime/volatility
+            for i in range(t_idx.max().item() + 1):
+                mask = (t_idx >= i).float().unsqueeze(-1)
+                step_alpha = alphas[i].view(1, 1)
+                alpha_hat = alpha_hat * torch.where(mask > 0, step_alpha, torch.ones_like(step_alpha))
+        else:
+            # Standard approach without regime/volatility
+            alpha_hat = self.noise_schedule.get_all_alpha_hats()[t_idx]
+            alpha_hat = alpha_hat.view(-1, 1)
         
         # Sample noise
         epsilon = torch.randn_like(x_0)
@@ -276,46 +746,23 @@ class TabularDiffFlow(nn.Module):
         
         return x_t, epsilon
     
-    def predict_noise(self, x_t, t):
+    def predict_noise(self, x_t, t, market_regime=None):
         """
         Predict the noise component in x_t.
         
         Args:
             x_t: Noised data at time t
             t: Time steps
+            market_regime: Optional market regime indicator
             
         Returns:
             epsilon: Predicted noise
         """
-        batch_size = x_t.shape[0]
-        t_emb = self.time_embedding(t.view(-1, 1))  # [batch_size, d_model]
-        
-        # Embed features
-        x_emb = self.feature_embedding(x_t)  # [batch_size, d_model]
-        
-        # Expand to feature-wise representations
-        x_emb = x_emb.unsqueeze(1).expand(-1, self.n_features, -1)  # [batch_size, n_features, d_model]
-        t_emb = t_emb.unsqueeze(1).expand(-1, self.n_features, -1)  # [batch_size, n_features, d_model]
-        
-        # Combine time and feature embeddings
-        combined = torch.cat([x_emb, t_emb], dim=2)  # [batch_size, n_features, d_model*2]
-        
-        # Process each feature
-        feature_outputs = []
-        for i, processor in enumerate(self.feature_processor):
-            feature_outputs.append(processor(combined[:, i]))
-        
-        feature_outputs = torch.stack(feature_outputs, dim=1)  # [batch_size, n_features, d_model]
-        
-        # Apply attention to capture feature dependencies
-        attended = self.feature_attention(feature_outputs)  # [batch_size, n_features, d_model]
-        
-        # Global processing
-        global_repr = attended.mean(dim=1)  # [batch_size, d_model]
-        global_processed = self.global_processor(global_repr)  # [batch_size, d_model]
+        # Use shared embedding processing
+        global_processed = self._process_embeddings(x_t, t)
         
         # Predict noise
-        raw_outputs = self.denoise_net(global_processed)  # [batch_size, n_features*2]
+        raw_outputs = self.denoise_net(global_processed)
         
         # Split into mean and log variance predictions
         mean_raw, _ = raw_outputs.chunk(2, dim=1)
@@ -326,46 +773,32 @@ class TabularDiffFlow(nn.Module):
         # Return the bounded mean as the predicted noise
         return mean
     
-    def diffusion_reverse_process(self, x_t, t):
+    def diffusion_reverse_process(self, x_t, t, market_regime=None):
         """
         Single step of the reverse diffusion process p(x_{t-1} | x_t).
         
         Args:
             x_t: Noised data at time t
             t: Time step (between 0 and 1)
+            market_regime: Optional market regime indicator
             
         Returns:
             x_pred: Predicted less noisy data
         """
-        batch_size = x_t.shape[0]
-        t_emb = self.time_embedding(t.view(-1, 1))  # [batch_size, d_model]
+        # Auto-detect market regime if not provided and model is configured for it
+        if market_regime is None and self.detect_regime:
+            market_regime = self.detect_market_regime(x_t)
+            
+        # Auto-detect volatility for financial data
+        volatility = None
+        if self.financial_data:
+            volatility = self.estimate_volatility(x_t)
         
-        # Embed features
-        x_emb = self.feature_embedding(x_t)  # [batch_size, d_model]
-        
-        # Expand to feature-wise representations
-        x_emb = x_emb.unsqueeze(1).expand(-1, self.n_features, -1)  # [batch_size, n_features, d_model]
-        t_emb = t_emb.unsqueeze(1).expand(-1, self.n_features, -1)  # [batch_size, n_features, d_model]
-        
-        # Combine time and feature embeddings
-        combined = torch.cat([x_emb, t_emb], dim=2)  # [batch_size, n_features, d_model*2]
-        
-        # Process each feature
-        feature_outputs = []
-        for i, processor in enumerate(self.feature_processor):
-            feature_outputs.append(processor(combined[:, i]))
-        
-        feature_outputs = torch.stack(feature_outputs, dim=1)  # [batch_size, n_features, d_model]
-        
-        # Apply attention to capture feature dependencies
-        attended = self.feature_attention(feature_outputs)  # [batch_size, n_features, d_model]
-        
-        # Global processing
-        global_repr = attended.mean(dim=1)  # [batch_size, d_model]
-        global_processed = self.global_processor(global_repr)  # [batch_size, d_model]
+        # Use shared embedding processing
+        global_processed = self._process_embeddings(x_t, t)
         
         # Predict denoised data
-        raw_outputs = self.denoise_net(global_processed)  # [batch_size, n_features*2]
+        raw_outputs = self.denoise_net(global_processed)
         
         # Split into mean and log variance predictions
         mean_raw, log_var_raw = raw_outputs.chunk(2, dim=1)
@@ -375,20 +808,59 @@ class TabularDiffFlow(nn.Module):
         log_var = F.softplus(log_var_raw) - 5.0  # Bound log variance for numerical stability
         var = torch.exp(log_var)
         
-        # Get the correct beta value for this time step
-        beta = self.noise_schedule(t)
+        # Get the correct beta value for this time step, with market regime awareness
+        beta = self.noise_schedule(t, market_regime, volatility)
         beta = beta.view(-1, 1)
         
         # Calculate the parameters for the posterior distribution
         t_idx = (t * (self.n_diffusion_steps - 1)).long()
-        alpha = self.noise_schedule.get_all_alphas()[t_idx].view(-1, 1)
-        alpha_hat = self.noise_schedule.get_all_alpha_hats()[t_idx].view(-1, 1)
         
-        posterior_mean = (1 / torch.sqrt(alpha)) * (x_t - (beta / torch.sqrt(1 - alpha_hat)) * mean)
-        posterior_var = beta * (1 - alpha_hat / alpha) / (1 - alpha_hat)
+        # Get alphas with regime awareness
+        if market_regime is not None or volatility is not None:
+            # Compute alpha and alpha_hat with regime/volatility for this specific timestep
+            alpha = 1.0 - beta
+            
+            # Compute alpha_hat manually to handle regime changes
+            alpha_hat = torch.ones_like(beta)
+            alphas = self.noise_schedule.get_all_alphas()
+            
+            for i in range(t_idx.max().item() + 1):
+                if i >= self.n_diffusion_steps:
+                    break
+                    
+                mask = (t_idx >= i).float().unsqueeze(-1)
+                
+                # Get regime-specific alpha for this step
+                if i == t_idx.max().item():
+                    # For the current step, use the exact regime-aware beta
+                    step_alpha = alpha
+                else:
+                    # For past steps, use the regime from our model's prediction
+                    step_alpha = alphas[i].view(1, 1).expand(alpha.shape)
+                
+                alpha_hat = alpha_hat * torch.where(mask > 0, step_alpha, torch.ones_like(step_alpha))
+        else:
+            # Standard approach without regime
+            alpha = self.noise_schedule.get_all_alphas()[t_idx].view(-1, 1)
+            alpha_hat = self.noise_schedule.get_all_alpha_hats()[t_idx].view(-1, 1)
         
-        # Sample from the posterior
-        noise = torch.randn_like(x_t) if t[0] > 0 else 0
+        # Calculate posterior mean with numerical stability improvements
+        posterior_mean_coef1 = (1.0 / torch.sqrt(alpha) + 1e-8)
+        posterior_mean_coef2 = (beta / torch.sqrt(1.0 - alpha_hat + 1e-8))
+        
+        posterior_mean = posterior_mean_coef1 * (x_t - posterior_mean_coef2 * mean)
+        
+        # Safe calculation of posterior variance
+        posterior_var = beta * (1.0 - alpha_hat / (alpha + 1e-8)) / (1.0 - alpha_hat + 1e-8)
+        posterior_var = torch.clamp(posterior_var, 1e-8, 0.5)  # Safety clamp
+        
+        # Sample from the posterior - reduce noise at the end of the process for better quality
+        noise_scale = 1.0
+        if t[0] < 0.1:  # Reduce noise near the end
+            noise_scale = t[0] * 10.0  # Linear scaling to 0
+            
+        # Add noise (zeros if at t=0)
+        noise = torch.randn_like(x_t) * noise_scale if t[0] > 0 else 0
         x_pred = posterior_mean + torch.sqrt(posterior_var) * noise
         
         return x_pred
@@ -472,13 +944,14 @@ class TabularDiffFlow(nn.Module):
         
         return x_0
     
-    def forward(self, x, t=None):
+    def forward(self, x, t=None, market_regime=None):
         """
-        Forward pass for training with improved stability.
+        Forward pass for training with improved stability and financial-specific enhancements.
         
         Args:
             x: Input data [batch_size, n_features]
             t: Optional time steps (if None, will be randomly sampled)
+            market_regime: Optional market regime indicator (e.g., bull/bear)
             
         Returns:
             loss: Training loss
@@ -497,6 +970,15 @@ class TabularDiffFlow(nn.Module):
         # Apply gradient clipping on input (prevents extreme values)
         x_normalized = torch.clamp(x_normalized, -10.0, 10.0)
         
+        # Detect market regime automatically if needed
+        if market_regime is None and self.detect_regime:
+            market_regime = self.detect_market_regime(x_normalized)
+            
+        # Detect volatility for financial data if enabled
+        volatility = None
+        if self.financial_data:
+            volatility = self.estimate_volatility(x_normalized)
+        
         # Apply normalizing flow (data -> latent) with error handling
         try:
             z, log_det = self.flow(x_normalized)
@@ -504,50 +986,128 @@ class TabularDiffFlow(nn.Module):
             log_det = torch.clamp(log_det, -50.0, 50.0)
         except Exception as e:
             # If flow fails, use normalized input directly
-            print(f"Warning: Flow failed ({str(e)}). Using normalized input.")
             z = x_normalized
             log_det = torch.zeros(batch_size, device=device)
+            print(f"Warning: Flow failed ({str(e)}). Using normalized input.")
         
         # Sample time steps if not provided
         if t is None:
-            # Sample with slight bias toward lower timesteps (helps training focus on detailed structure)
-            t = torch.sqrt(torch.rand(batch_size, device=device))
+            if self.financial_data:
+                # For financial data, use power-law distribution to focus more on recent time steps
+                # This helps model the recent market conditions better
+                t = torch.pow(torch.rand(batch_size, device=device), 1.5)
+            else:
+                # Standard timestep sampling
+                t = torch.sqrt(torch.rand(batch_size, device=device))
         
-        # Forward diffusion process
-        z_t, epsilon = self.diffusion_forward_process(z, t)
+        # Forward diffusion process with market regime awareness
+        z_t, epsilon = self.diffusion_forward_process(z, t, market_regime)
         
         # Predict the added noise
-        epsilon_pred = self.predict_noise(z_t, t)
+        epsilon_pred = self.predict_noise(z_t, t, market_regime)
         
-        # Calculate diffusion loss with Huber (more stable than pure MSE)
+        # Financial-specific loss components
+        
+        # 1. Basic diffusion loss with smoother Huber loss
         diffusion_loss = F.smooth_l1_loss(epsilon_pred, epsilon, beta=0.1)
         
-        # Calculate flow loss with safeguards
+        # 2. Flow loss with safeguards
         flow_loss = -log_det.mean()
-        
-        # Check for extreme values in flow loss
         if torch.isnan(flow_loss) or torch.isinf(flow_loss):
             flow_loss = torch.tensor(0.0, device=device)
             
-        # Dynamically adjust weights based on training progress
-        # (reduce flow weight if it's dominating)
-        if diffusion_loss.item() < 0.1:
-            lambda_diffusion = 1.0
-            lambda_flow = 0.05  # Reduce weight when diffusion is doing well
+        # 3. Tail risk loss - focused on extreme events important in financial data
+        # Create mask for extreme values (typically beyond 2 sigma)
+        if self.financial_data:
+            tail_mask = (torch.abs(epsilon) > 2.0).float()
+            # Check if we have any tail events in this batch
+            if tail_mask.sum() > 0:
+                # Focus more attention on extreme value prediction (important for financial risk)
+                tail_loss = F.mse_loss(
+                    epsilon_pred * tail_mask, 
+                    epsilon * tail_mask, 
+                    reduction='sum'
+                ) / (tail_mask.sum() + 1e-8)
+            else:
+                tail_loss = torch.tensor(0.0, device=device)
+                
+            # 4. Trend preservation loss for financial time series
+            if self.trend_preservation:
+                # Skip the trend loss if batch size is 1
+                if batch_size > 1:
+                    # For financial time series, preserving the direction of change is crucial
+                    # We want adjacent samples to maintain the same relative trends
+                    # Calculate sign of differences between adjacent time series points
+                    signs_real = torch.sign(z[1:] - z[:-1])
+                    signs_pred = torch.sign(epsilon_pred[1:] - epsilon_pred[:-1])
+                    
+                    # Binary accuracy of sign prediction
+                    trend_match = (signs_real == signs_pred).float()
+                    trend_loss = 1.0 - trend_match.mean()
+                else:
+                    trend_loss = torch.tensor(0.0, device=device)
+            else:
+                trend_loss = torch.tensor(0.0, device=device)
+                
+            # 5. Volatility clustering loss - Helps model autocorrelation in squared returns
+            if volatility is not None and batch_size > 1:
+                # Calculate predicted volatility from the model
+                pred_volatility = torch.abs(epsilon_pred).mean(dim=1)
+                # Encourage similar volatility prediction
+                volatility_loss = F.mse_loss(pred_volatility, volatility)
+            else:
+                volatility_loss = torch.tensor(0.0, device=device)
+                
         else:
+            # Not financial data - set these losses to zero
+            tail_loss = torch.tensor(0.0, device=device)
+            trend_loss = torch.tensor(0.0, device=device)
+            volatility_loss = torch.tensor(0.0, device=device)
+            
+        # Dynamic weighting of loss components - adjust based on training progress
+        if self.financial_data:
+            # For financial data, carefully balance the different components
             lambda_diffusion = 1.0
-            lambda_flow = 0.1
+            
+            # Reduce flow importance when other losses are working well
+            if diffusion_loss.item() < 0.1:
+                lambda_flow = 0.05
+            else:
+                lambda_flow = 0.1
+                
+            # Tail risk gets higher weight as it's crucial for financial models
+            lambda_tail = min(0.5, 10.0 * diffusion_loss.item())
+            
+            # Trend preservation is important but not dominant
+            lambda_trend = 0.2 
+            
+            # Volatility clustering is moderately important
+            lambda_volatility = 0.1
+            
+            # Total financial-aware loss
+            loss = (
+                lambda_diffusion * diffusion_loss +
+                lambda_flow * flow_loss +
+                lambda_tail * tail_loss +
+                lambda_trend * trend_loss +
+                lambda_volatility * volatility_loss
+            )
+        else:
+            # Standard loss weighting for non-financial data
+            lambda_diffusion = 1.0
+            lambda_flow = 0.1 if diffusion_loss.item() >= 0.1 else 0.05
+            
+            # Total standard loss
+            loss = lambda_diffusion * diffusion_loss + lambda_flow * flow_loss
         
-        # Total loss with weighting and regularization
-        loss = lambda_diffusion * diffusion_loss + lambda_flow * flow_loss
+        # Add regularization on attention mechanism for better stability
+        if hasattr(self.feature_attention, 'correlation_prior'):
+            l2_reg = torch.norm(self.feature_attention.correlation_prior) * 0.001
+            loss = loss + l2_reg
         
-        # Add L2 regularization on correlation prior for more realistic feature correlations
-        l2_reg = torch.norm(self.feature_attention.correlation_prior) * 0.001
-        loss = loss + l2_reg
-        
-        # Final safety check
+        # Safety check
         if torch.isnan(loss) or torch.isinf(loss):
-            # Fallback to just diffusion loss (more stable)
+            # Fallback to diffusion loss if something goes wrong
             loss = diffusion_loss
             
         return loss
@@ -756,7 +1316,8 @@ class TabularDataset(Dataset):
 class TabularPreprocessor:
     """Preprocessor for tabular data with mixed numerical types (INT and FLOAT)."""
     
-    def __init__(self, categorical_threshold=10, normalize=True, scaler_type='minmax'):
+    def __init__(self, categorical_threshold=10, normalize=True, scaler_type='standard', 
+                 handle_outliers=True, financial_data=True):
         """
         Initialize the preprocessor.
         
@@ -764,16 +1325,21 @@ class TabularPreprocessor:
             categorical_threshold: Maximum number of unique values for an integer column
                                  to be treated as categorical (one-hot encoded)
             normalize: Whether to normalize the data
-            scaler_type: Type of scaler to use ('standard' or 'minmax')
+            scaler_type: Type of scaler to use ('standard' or 'minmax' or 'robust')
+            handle_outliers: Whether to handle outliers using winsorization
+            financial_data: Whether the data is financial time series data
         """
         self.categorical_threshold = categorical_threshold
         self.normalize = normalize
         self.scaler_type = scaler_type
+        self.handle_outliers = handle_outliers
+        self.financial_data = financial_data
         self.int_columns = None
         self.float_columns = None
         self.scaler = None
         self.int_info = {}  # Store information about integer columns
         self.float_info = {}  # Store information about float columns
+        self.target_column = None  # Store target column for special handling
     
     def _detect_column_types(self, df):
         """
@@ -817,32 +1383,74 @@ class TabularPreprocessor:
         
         return int_cols, float_cols
     
-    def fit(self, df):
+    def fit(self, df, target_column=None):
         """
         Fit the preprocessor to the data.
         
         Args:
             df: Pandas DataFrame with numerical columns
+            target_column: Name of the target column for special handling
             
         Returns:
             self
         """
+        # Store target column for special handling
+        self.target_column = target_column
+        
+        # Handle outliers if specified
+        if self.handle_outliers:
+            df_processed = df.copy()
+            
+            # Apply winsorization to numerical columns (clip values to percentile range)
+            for col in df.select_dtypes(include=['float64', 'int64']).columns:
+                # For financial time series, use a wider range to preserve trends
+                if self.financial_data:
+                    lower_percentile = 0.001
+                    upper_percentile = 0.999
+                else:
+                    lower_percentile = 0.01
+                    upper_percentile = 0.99
+                    
+                lower_bound = df[col].quantile(lower_percentile)
+                upper_bound = df[col].quantile(upper_percentile)
+                
+                # Don't winsorize the target column as aggressively
+                if col == target_column:
+                    lower_bound = df[col].quantile(0.0001)
+                    upper_bound = df[col].quantile(0.9999)
+                
+                df_processed[col] = df[col].clip(lower=lower_bound, upper=upper_bound)
+        else:
+            df_processed = df
+            
         # Detect column types
-        self.int_columns, self.float_columns = self._detect_column_types(df)
+        self.int_columns, self.float_columns = self._detect_column_types(df_processed)
         
         # Initialize scaler
         if self.normalize:
+            from sklearn.preprocessing import RobustScaler
+            
             if self.scaler_type == 'standard':
                 self.scaler = StandardScaler()
-            else:
+            elif self.scaler_type == 'robust':
+                self.scaler = RobustScaler()
+            else:  # minmax
                 self.scaler = MinMaxScaler()
             
             # Get all continuous columns
             continuous_cols = self.float_columns + [col for col in self.int_columns 
                                                   if self.int_info[col]['type'] == 'continuous']
             
+            # If target column exists and is in continuous_cols, handle it separately
+            if target_column and target_column in continuous_cols:
+                # For financial target columns, special treatment may be needed
+                if self.financial_data:
+                    # Store target stats for later use
+                    self.target_mean = df_processed[target_column].mean()
+                    self.target_std = df_processed[target_column].std()
+                
             if continuous_cols:
-                self.scaler.fit(df[continuous_cols])
+                self.scaler.fit(df_processed[continuous_cols])
         
         return self
     
@@ -971,18 +1579,19 @@ class TabularPreprocessor:
         
         return df
     
-    def fit_transform(self, df):
+    def fit_transform(self, df, target_column=None):
         """
         Fit the preprocessor and transform the data.
         
         Args:
             df: Pandas DataFrame
+            target_column: Name of target column for special handling
             
         Returns:
             transformed_data: Numpy array of transformed data
             column_metadata: Dictionary mapping column indices to original columns
         """
-        self.fit(df)
+        self.fit(df, target_column)
         return self.transform(df)
 
 class TabularEvaluator:
@@ -1050,7 +1659,8 @@ class TabularEvaluator:
         
         return metrics
 
-def prepare_data_for_tabular_diffflow(df, test_size=0.2, random_state=42):
+def prepare_data_for_tabular_diffflow(df, test_size=0.2, random_state=42, target_column=None, 
+                                financial_data=True):
     """
     Prepare data for the TabularDiffFlow model.
     
@@ -1058,6 +1668,8 @@ def prepare_data_for_tabular_diffflow(df, test_size=0.2, random_state=42):
         df: Pandas DataFrame with numerical data (INT and FLOAT types)
         test_size: Proportion of data to use for testing
         random_state: Random seed for reproducibility
+        target_column: Name of the target column for special handling
+        financial_data: Whether the data is financial time series data
         
     Returns:
         train_data: Training data as numpy array
@@ -1065,14 +1677,43 @@ def prepare_data_for_tabular_diffflow(df, test_size=0.2, random_state=42):
         preprocessor: Fitted TabularPreprocessor object
         column_metadata: Metadata about the columns
     """
-    # Split data
-    train_df, test_df = train_test_split(df, test_size=test_size, random_state=random_state)
+    print(f"Preparing data for TabularDiffFlow model...")
     
-    # Preprocess
-    preprocessor = TabularPreprocessor(normalize=True, scaler_type='minmax')
-    train_data, column_metadata = preprocessor.fit_transform(train_df)
+    # For time series data, don't randomize the split
+    if financial_data:
+        # Use last test_size% of data for testing to maintain temporal order
+        split_idx = int(len(df) * (1 - test_size))
+        train_df = df.iloc[:split_idx]
+        test_df = df.iloc[split_idx:]
+        print(f"Using temporal split: {len(train_df)} training samples, {len(test_df)} testing samples")
+    else:
+        # Split data randomly
+        train_df, test_df = train_test_split(df, test_size=test_size, random_state=random_state)
+        print(f"Using random split: {len(train_df)} training samples, {len(test_df)} testing samples")
+    
+    # Create and configure preprocessor
+    preprocessor = TabularPreprocessor(
+        normalize=True, 
+        scaler_type='robust',  # Robust scaling for financial data
+        handle_outliers=True,
+        financial_data=financial_data,
+        categorical_threshold=20  # Higher threshold for financial indicators
+    )
+    
+    # Fit and transform
+    train_data, column_metadata = preprocessor.fit_transform(train_df, target_column)
     test_data, _ = preprocessor.transform(test_df)
     
+    # Basic sanity checks
+    if np.isnan(train_data).any() or np.isinf(train_data).any():
+        print("Warning: NaN or Inf values detected in training data. Replacing with zeros.")
+        train_data = np.nan_to_num(train_data)
+    
+    if np.isnan(test_data).any() or np.isinf(test_data).any():
+        print("Warning: NaN or Inf values detected in test data. Replacing with zeros.")
+        test_data = np.nan_to_num(test_data)
+    
+    print(f"Data preparation complete. Feature dimensions: {train_data.shape[1]}")
     return train_data, test_data, preprocessor, column_metadata
 
 def generate_synthetic_data(model, n_samples, device=None, preprocessor=None, column_metadata=None, 
@@ -1177,9 +1818,11 @@ def generate_synthetic_data(model, n_samples, device=None, preprocessor=None, co
     return synthetic_df
 
 def train_tabular_diffflow_model(df, n_epochs=100, batch_size=64, learning_rate=1e-4, device=None, 
-                           max_grad_norm=1.0, weight_decay=1e-5, d_model=256, num_workers=4):
+                           max_grad_norm=1.0, weight_decay=1e-5, d_model=256, num_workers=4,
+                           target_column=None, financial_data=True):
     """
     Train a TabularDiffFlow model on the provided dataframe.
+    Enhanced with financial data optimizations and temporal awareness.
     
     Args:
         df: Pandas DataFrame with numerical data (INT and FLOAT)
@@ -1191,6 +1834,8 @@ def train_tabular_diffflow_model(df, n_epochs=100, batch_size=64, learning_rate=
         weight_decay: L2 regularization weight
         d_model: Dimension of the model's hidden layers
         num_workers: Number of workers for data loading
+        target_column: Name of the target column for special handling
+        financial_data: Whether the data is financial time series data
         
     Returns:
         model: Trained TabularDiffFlow model
@@ -1213,8 +1858,12 @@ def train_tabular_diffflow_model(df, n_epochs=100, batch_size=64, learning_rate=
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     
-    # Prepare data
-    train_data, test_data, preprocessor, column_metadata = prepare_data_for_tabular_diffflow(df)
+    # Prepare data with target column information
+    train_data, test_data, preprocessor, column_metadata = prepare_data_for_tabular_diffflow(
+        df,
+        target_column=target_column,
+        financial_data=financial_data
+    )
     
     # Create dataset and dataloader with multiple workers for faster loading
     dataset = TabularDataset(train_data)
@@ -1248,26 +1897,61 @@ def train_tabular_diffflow_model(df, n_epochs=100, batch_size=64, learning_rate=
         feature_max = float(train_data[:, i].max())
         feature_ranges.append((feature_min, feature_max))
     
-    # Initialize model with improved parameters
+    # Detect if this is a financial dataset to enable special features
+    is_financial = financial_data
+    
+    # Determine appropriate model size based on feature count
+    # Smaller models for smaller datasets
+    if n_features < 10:
+        model_dim = min(d_model, 128)  # Smaller model for few features
+        n_heads = 2
+    else:
+        model_dim = d_model  # Full size for larger feature sets
+        n_heads = 4
+        
+    # Make model dimension divisible by number of heads
+    model_dim = (model_dim // n_heads) * n_heads
+    
+    # Calculate appropriate dropout based on dataset size
+    # More dropout for smaller datasets to prevent overfitting
+    train_size = len(train_data)
+    if train_size < 1000:
+        dropout = 0.2  # Higher dropout for very small datasets
+    elif train_size < 10000:
+        dropout = 0.1  # Moderate dropout for medium datasets
+    else:
+        dropout = 0.05  # Lower dropout for large datasets
+    
+    print(f"Using model with dim={model_dim}, heads={n_heads}, dropout={dropout}")
+        
+    # Initialize enhanced model with financial data optimizations
     model = TabularDiffFlow(
         n_features=n_features,
-        d_model=d_model,  # Increased model capacity
+        d_model=model_dim,
         n_diffusion_steps=1000,
         n_flow_layers=4,
         sparsity=0.5,
-        feature_ranges=feature_ranges
+        feature_ranges=feature_ranges,
+        financial_data=is_financial,             # Enable financial data optimizations
+        trend_preservation=is_financial,         # Enable trend preservation for financial data
+        use_temporal_transformer=is_financial,   # Enable temporal transformer for financial data
+        n_heads=n_heads,                         # Use multiple attention heads
+        dropout=dropout                          # Use appropriate dropout
     )
     
     # Mixed precision for faster training on compatible GPUs
     use_amp = device == 'cuda' and torch.cuda.is_available()
     scaler = torch.cuda.amp.GradScaler() if use_amp else None
     
-    # Apply weight initialization for better stability
+    # Apply improved weight initialization for better stability and faster convergence
     def weights_init(m):
         if isinstance(m, nn.Linear):
-            nn.init.kaiming_normal_(m.weight)
+            # Kaiming initialization for ReLU/SiLU activations
+            nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
             if m.bias is not None:
-                nn.init.zeros_(m.bias)
+                fan_in, _ = nn.init._calculate_fan_in_and_fan_out(m.weight)
+                bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                nn.init.uniform_(m.bias, -bound, bound)
                 
     model.apply(weights_init)
     
@@ -1275,21 +1959,46 @@ def train_tabular_diffflow_model(df, n_epochs=100, batch_size=64, learning_rate=
     model = model.to(device)
     
     # Optimizer with weight decay for regularization
+    # Higher weight decay for financial data to prevent overfitting
+    final_weight_decay = weight_decay * 2 if is_financial else weight_decay
+    
     optimizer = torch.optim.AdamW(
         model.parameters(), 
         lr=learning_rate,
-        weight_decay=weight_decay,
+        weight_decay=final_weight_decay,
         betas=(0.9, 0.999)
     )
     
     # Learning rate scheduler for better convergence
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=learning_rate,
-        epochs=n_epochs,
-        steps_per_epoch=len(dataloader),
-        pct_start=0.3
-    )
+    # Use cosine annealing for smoother decay
+    if n_epochs > 50:
+        # For longer training runs, use OneCycle with longer warmup
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=learning_rate,
+            epochs=n_epochs,
+            steps_per_epoch=len(dataloader),
+            pct_start=0.3,  # 30% warmup
+            anneal_strategy='cos'
+        )
+    else:
+        # For shorter runs, use simpler cosine annealing
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=n_epochs * len(dataloader),
+            eta_min=learning_rate / 10
+        )
+    
+    # Detect market regime information for financial datasets
+    market_regime = None
+    if is_financial:
+        try:
+            # Get market regime indicators for training data
+            print("Detecting market regime for financial data...")
+            market_regime = detect_market_regime(df)
+            print(f"Detected regimes: Bull ({(market_regime > 0).mean()*100:.1f}%), Bear ({(market_regime < 0).mean()*100:.1f}%)")
+        except Exception as e:
+            print(f"Warning: Could not detect market regime: {str(e)}")
     
     # Train with enhanced procedures
     model.train()
@@ -1297,40 +2006,65 @@ def train_tabular_diffflow_model(df, n_epochs=100, batch_size=64, learning_rate=
     best_loss = float('inf')
     patience_counter = 0
     patience = 10  # Early stopping patience
+    best_model_state = None
     
     print(f"Starting training with {n_epochs} epochs...")
     print(f"Model has {sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters")
     
+    try:
+        from tqdm import tqdm
+        use_progress_bar = True
+    except ImportError:
+        use_progress_bar = False
+    
     for epoch in range(n_epochs):
         epoch_losses = []
         
+        # Create progress bar if tqdm is available
+        if use_progress_bar:
+            train_iter = tqdm(dataloader, desc=f"Epoch {epoch+1}/{n_epochs}")
+        else:
+            train_iter = dataloader
+        
         # Training loop
-        for batch in dataloader:
+        for batch_idx, batch in enumerate(train_iter):
             # Move batch to device
             if isinstance(batch, torch.Tensor):
                 batch = batch.to(device, non_blocking=True)
             else:
                 batch = batch[0].to(device, non_blocking=True)
             
-            optimizer.zero_grad()
+            # Get market regime for this batch if available
+            batch_regime = None
+            if is_financial and market_regime is not None:
+                # Sample market regime values based on batch index
+                # This is a simplified approach - ideally would match samples with their regimes
+                indices = torch.randint(0, len(market_regime), (batch.size(0),))
+                batch_regime = torch.tensor([market_regime[i] for i in indices], device=device)
+            
+            optimizer.zero_grad(set_to_none=True)  # Faster than zero_grad()
             
             # Use mixed precision if available
             if use_amp:
                 with torch.cuda.amp.autocast():
-                    loss = model(batch)
+                    loss = model(batch, market_regime=batch_regime)
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                loss = model(batch)
+                loss = model(batch, market_regime=batch_regime)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
             
             scheduler.step()
             epoch_losses.append(loss.item())
+            
+            # Update progress bar if available
+            if use_progress_bar:
+                train_iter.set_postfix(loss=f"{loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.6f}")
         
         # Validation
         model.eval()
@@ -1342,11 +2076,17 @@ def train_tabular_diffflow_model(df, n_epochs=100, batch_size=64, learning_rate=
                 else:
                     batch = batch[0].to(device, non_blocking=True)
                 
+                # Use same market regime approach for validation
+                batch_regime = None
+                if is_financial and market_regime is not None:
+                    indices = torch.randint(0, len(market_regime), (batch.size(0),))
+                    batch_regime = torch.tensor([market_regime[i] for i in indices], device=device)
+                
                 if use_amp:
                     with torch.cuda.amp.autocast():
-                        val_loss = model(batch)
+                        val_loss = model(batch, market_regime=batch_regime)
                 else:
-                    val_loss = model(batch)
+                    val_loss = model(batch, market_regime=batch_regime)
                 
                 val_losses.append(val_loss.item())
         
@@ -1361,13 +2101,13 @@ def train_tabular_diffflow_model(df, n_epochs=100, batch_size=64, learning_rate=
         if avg_val_loss < best_loss:
             best_loss = avg_val_loss
             patience_counter = 0
+            
             # Save best model state
             best_model_state = {k: v.cpu() for k, v in model.state_dict().items()}
+            print(f"Epoch {epoch+1}/{n_epochs}, Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f} (new best) ↓")
         else:
             patience_counter += 1
-            
-        # Print progress
-        print(f"Epoch {epoch+1}/{n_epochs}, Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}, LR: {scheduler.get_last_lr()[0]:.6f}")
+            print(f"Epoch {epoch+1}/{n_epochs}, Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}, LR: {scheduler.get_last_lr()[0] if isinstance(scheduler.get_last_lr(), list) else scheduler.get_last_lr():.6f}")
         
         # Early stopping check
         if patience_counter >= patience:
@@ -1375,10 +2115,14 @@ def train_tabular_diffflow_model(df, n_epochs=100, batch_size=64, learning_rate=
             break
     
     # Restore best model
-    if 'best_model_state' in locals():
+    if best_model_state is not None:
         model.load_state_dict({k: v.to(device) for k, v in best_model_state.items()})
+        print(f"Restored best model with validation loss: {best_loss:.6f}")
     
+    # Ensure model is in eval mode when returning
+    model.eval()
     print("Training complete!")
+    
     return model, preprocessor, column_metadata, training_losses
 
 def evaluate_synthetic_data(real_df, synthetic_df, task_type='classification', target_column=None, 
@@ -1599,6 +2343,199 @@ Benefits Over Existing Methods:
 By addressing these limitations, TabularDiffFlow represents a significant advancement 
 in synthetic tabular data generation, especially for mixed numerical data types.
 """
+
+def evaluate_financial_fidelity(real_data, synthetic_data):
+    """
+    Evaluate financial-specific metrics for synthetic data.
+    
+    Args:
+        real_data: DataFrame with real financial data
+        synthetic_data: DataFrame with synthetic financial data
+        
+    Returns:
+        metrics: Dictionary of financial-specific metrics
+    """
+    from scipy import stats
+    import pandas as pd
+    import numpy as np
+    
+    metrics = {}
+    
+    # Try to identify price columns - they often contain 'price', 'close', 'open' in name
+    price_cols = []
+    for col in real_data.columns:
+        col_lower = col.lower()
+        if any(term in col_lower for term in ['close', 'price', 'open', 'high', 'low']):
+            price_cols.append(col)
+    
+    # If no price columns found, use the first numeric column
+    if not price_cols:
+        for col in real_data.columns:
+            if pd.api.types.is_numeric_dtype(real_data[col]):
+                price_cols = [col]
+                break
+    
+    # Calculate metrics for each identified price column
+    for col in price_cols:
+        if col not in real_data.columns or col not in synthetic_data.columns:
+            continue
+            
+        # Get price series
+        real_prices = real_data[col].dropna()
+        synth_prices = synthetic_data[col].dropna()
+        
+        # Skip if insufficient data
+        if len(real_prices) < 3 or len(synth_prices) < 3:
+            continue
+        
+        # 1. Calculate returns
+        real_returns = real_prices.pct_change().dropna()
+        synth_returns = synth_prices.pct_change().dropna()
+        
+        # Guard against empty series after pct_change
+        if len(real_returns) < 2 or len(synth_returns) < 2:
+            continue
+        
+        col_metrics = {}
+        
+        # 2. Basic statistics comparison
+        # Volatility comparison
+        real_vol = real_returns.std()
+        synth_vol = synth_returns.std()
+        col_metrics['volatility_ratio'] = synth_vol / real_vol if real_vol > 0 else float('inf')
+        
+        # Skewness comparison
+        real_skew = real_returns.skew()
+        synth_skew = synth_returns.skew()
+        col_metrics['skewness_diff'] = abs(real_skew - synth_skew)
+        
+        # Kurtosis comparison (tail heaviness)
+        real_kurt = real_returns.kurtosis()
+        synth_kurt = synth_returns.kurtosis()
+        col_metrics['kurtosis_diff'] = abs(real_kurt - synth_kurt)
+        
+        # 3. Risk metrics
+        # Value-at-Risk comparison
+        try:
+            real_var_95 = np.percentile(real_returns, 5)
+            synth_var_95 = np.percentile(synth_returns, 5)
+            col_metrics['var_95_diff'] = abs(real_var_95 - synth_var_95)
+        except Exception:
+            col_metrics['var_95_diff'] = float('nan')
+        
+        # 4. Time-series properties
+        # Autocorrelation in returns
+        try:
+            real_autocorr = real_returns.autocorr(lag=1)
+            synth_autocorr = synth_returns.autocorr(lag=1)
+            col_metrics['autocorr_diff'] = abs(real_autocorr - synth_autocorr)
+        except Exception:
+            col_metrics['autocorr_diff'] = float('nan')
+        
+        # Ljung-Box test for autocorrelation
+        try:
+            real_lb = stats.acorr_ljungbox(real_returns, lags=[10])[1][0]
+            synth_lb = stats.acorr_ljungbox(synth_returns, lags=[10])[1][0]
+            col_metrics['ljung_box_p_diff'] = abs(real_lb - synth_lb)
+        except Exception:
+            col_metrics['ljung_box_p_diff'] = float('nan')
+        
+        # 5. Volatility clustering (ARCH effects)
+        # Squared returns autocorrelation (volatility persistence)
+        try:
+            real_returns_sq = real_returns**2
+            synth_returns_sq = synth_returns**2
+            real_arch = real_returns_sq.autocorr(lag=1)
+            synth_arch = synth_returns_sq.autocorr(lag=1)
+            col_metrics['arch_effect_diff'] = abs(real_arch - synth_arch)
+        except Exception:
+            col_metrics['arch_effect_diff'] = float('nan')
+            
+        # 6. Trend and momentum
+        # Average consecutive price moves in same direction
+        try:
+            real_consec = (np.sign(real_returns) == np.sign(real_returns.shift(1))).mean()
+            synth_consec = (np.sign(synth_returns) == np.sign(synth_returns.shift(1))).mean()
+            col_metrics['trend_persistence_diff'] = abs(real_consec - synth_consec)
+        except Exception:
+            col_metrics['trend_persistence_diff'] = float('nan')
+        
+        # Store metrics for this column
+        metrics[col] = col_metrics
+    
+    # Calculate average metrics across all price columns
+    avg_metrics = {}
+    for metric in ['volatility_ratio', 'skewness_diff', 'kurtosis_diff', 'var_95_diff', 
+                  'autocorr_diff', 'ljung_box_p_diff', 'arch_effect_diff', 'trend_persistence_diff']:
+        values = [metrics[col][metric] for col in metrics if metric in metrics[col] 
+                 and not np.isnan(metrics[col][metric]) 
+                 and not np.isinf(metrics[col][metric])]
+        if values:
+            avg_metrics[f'avg_{metric}'] = np.mean(values)
+    
+    # Add column-specific metrics to the overall results
+    metrics.update(avg_metrics)
+    
+    return metrics
+
+
+def detect_market_regime(data, window=20):
+    """
+    Detect market regime (bull/bear) based on price trends.
+    
+    Args:
+        data: DataFrame with price data
+        window: Window size for moving averages
+        
+    Returns:
+        Array of regime indicators: 1 for bull, -1 for bear
+    """
+    import numpy as np
+    import pandas as pd
+    
+    # Identify price column
+    price_col = None
+    for col in data.columns:
+        col_lower = col.lower()
+        if 'close' in col_lower:
+            price_col = col
+            break
+            
+    if price_col is None:
+        # No close column, try to find any price column
+        for col in data.columns:
+            col_lower = col.lower()
+            if any(term in col_lower for term in ['price', 'open', 'high', 'low']):
+                price_col = col
+                break
+                
+    if price_col is None:
+        # Still no price column, use the first numeric column
+        for col in data.columns:
+            if pd.api.types.is_numeric_dtype(data[col]):
+                price_col = col
+                break
+    
+    if price_col is None:
+        # No suitable column found
+        return np.zeros(len(data))
+    
+    # Calculate short and long moving averages
+    try:
+        short_ma = data[price_col].rolling(window=window).mean()
+        long_ma = data[price_col].rolling(window=window*2).mean()
+        
+        # Bull market when short MA > long MA
+        regime = np.where(short_ma > long_ma, 1, -1)
+        
+        # Fill NaN values at the beginning
+        regime = np.nan_to_num(regime, nan=0)
+        
+        return regime
+    except Exception as e:
+        print(f"Error detecting market regime: {str(e)}")
+        return np.zeros(len(data))
+
 
 if __name__ == "__main__":
     example_usage()

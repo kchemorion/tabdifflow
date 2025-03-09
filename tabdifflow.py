@@ -468,14 +468,16 @@ def run_benchmark(dataset_path, target_col, task='classification', epochs=100, n
         
         try:
             if model_name == "TabularDiffFlow":
-                # Use our improved training procedure
+                # Use our improved training procedure with target column
                 model = train_tabular_diffflow_model(
                     real_data,
                     n_epochs=epochs,
-                    batch_size=64,
+                    batch_size=128,  # Larger batch size for financial data
                     device=device,
-                    d_model=256,  # Increased model capacity
-                    weight_decay=1e-5
+                    d_model=128,  # Reduced model size for faster training
+                    weight_decay=1e-4,  # Stronger regularization for financial data
+                    target_column=target_col,
+                    financial_data=True  # Enable financial data optimizations
                 )
             
             elif model_name == "CTGAN":
