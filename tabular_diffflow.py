@@ -141,112 +141,24 @@ class SparseFeatureAttention(EnhancedSparseFeatureAttention):
     """Legacy class for backward compatibility."""
     pass
 
-class FinancialNoiseSchedule(nn.Module):
-    """
-    Adaptive noise schedule optimized for financial data.
-    
-    Key enhancements:
-    1. Implements regime-aware noise scheduling to better model bull/bear markets
-    2. Focuses noise schedule on early and late diffusion steps for better time-series
-    3. Provides tail-risk adjustments for better modeling of financial extremes
-    """
-    def __init__(self, n_timesteps, init_beta_min=1e-4, init_beta_max=2e-2, regime_aware=True):
+class StandardNoiseSchedule(nn.Module):
+    def __init__(self, n_timesteps, beta_start=1e-4, beta_end=0.02):
         super().__init__()
-        # Initialize with optimized schedule for financial data - more noise in the middle steps
-        # to better preserve financial time series patterns
-        raw_values = torch.zeros(n_timesteps)
-        # Quadratic schedule provides more focus on early and late diffusion steps
-        # which helps maintain temporal correlations better in financial data
-        for i in range(n_timesteps):
-            # Quadratic curve with higher values in middle
-            norm_i = i / (n_timesteps - 1)
-            # Skewed towards preserving the original signal longer
-            val = -6 + 24 * norm_i - 12 * (norm_i ** 2)  
-            raw_values[i] = val
-            
-        self.raw_betas = nn.Parameter(raw_values)
         self.n_timesteps = n_timesteps
-        self.init_beta_min = init_beta_min
-        self.init_beta_max = init_beta_max
-        
-        # Regime-aware component for financial markets
-        self.regime_aware = regime_aware
-        if regime_aware:
-            # Initialize with small random values
-            self.regime_modulation = nn.Parameter(torch.randn(n_timesteps) * 0.01)
-            
-            # Tail risk adjustment for better handling of financial extremes
-            self.tail_adjustment = nn.Parameter(torch.zeros(n_timesteps) + 0.1)
-        
-    def forward(self, t_normalized, regime_indicator=None, volatility=None):
-        """
-        Args:
-            t_normalized: Normalized time steps between 0 and 1
-            regime_indicator: Optional indicator of market regime (e.g., bull=1, bear=-1)
-            volatility: Optional estimate of current market volatility
-            
-        Returns:
-            Beta values for the corresponding time steps
-        """
-        t_idx = (t_normalized * (self.n_timesteps - 1)).long()
-        base_betas = self.get_all_betas()
-        
-        # Apply regime awareness if available
-        if self.regime_aware and regime_indicator is not None:
-            # Modulate noise based on regime (market state)
-            regime_mod = torch.sigmoid(self.regime_modulation) * 0.1
-            
-            # Convert scalar regime indicator to appropriate shape
-            if not isinstance(regime_indicator, torch.Tensor):
-                regime_indicator = torch.tensor([regime_indicator], device=t_normalized.device)
-            if regime_indicator.dim() == 0:
-                regime_indicator = regime_indicator.unsqueeze(0)
-            if regime_indicator.dim() == 1 and regime_indicator.size(0) == 1 and t_normalized.size(0) > 1:
-                regime_indicator = regime_indicator.expand(t_normalized.size(0))
-                
-            # Calculate factor based on regime (bull markets have less noise)
-            regime_factor = 1.0 - regime_indicator.view(-1, 1) * regime_mod[t_idx]
-            betas = base_betas[t_idx] * regime_factor
-        else:
-            betas = base_betas[t_idx]
-        
-        # Apply volatility adjustment if available
-        if self.regime_aware and volatility is not None:
-            # For high volatility, increase noise to better capture uncertain movements
-            if not isinstance(volatility, torch.Tensor):
-                volatility = torch.tensor([volatility], device=t_normalized.device)
-            if volatility.dim() == 0:
-                volatility = volatility.unsqueeze(0)
-            if volatility.dim() == 1 and volatility.size(0) == 1 and t_normalized.size(0) > 1:
-                volatility = volatility.expand(t_normalized.size(0))
-                
-            # Normalize volatility factor (assuming volatility is already standardized)
-            # Higher volatility -> more noise to capture larger price movements
-            vol_factor = 1.0 + torch.clamp(volatility.view(-1, 1) * 0.2, -0.2, 0.5)
-            betas = betas * vol_factor
-            
-            # Apply tail adjustment for extreme values (financial tail risk)
-            tail_adj = torch.sigmoid(self.tail_adjustment)[t_idx]
-            # More extreme values get more adjustment
-            extreme_mask = (volatility.view(-1, 1) > 2.0).float()
-            betas = betas + tail_adj * extreme_mask * 0.01
-        
-        # Safety clamp to ensure betas remain in valid range
-        return torch.clamp(betas, self.init_beta_min, self.init_beta_max * 1.5)
-        
-    def get_all_betas(self):
-        """Return all beta values with constraint applied."""
-        # Apply sigmoid and scale to the desired range
-        return torch.sigmoid(self.raw_betas) * (self.init_beta_max - self.init_beta_min) + self.init_beta_min
-    
-    def get_all_alphas(self):
-        """Return all alpha values (1 - beta)."""
-        return 1 - self.get_all_betas()
-    
-    def get_all_alpha_hats(self):
-        """Return all cumulative products of alphas."""
-        alphas = self.get_all_alphas()
-        return torch.cumprod(alphas, dim=0)
+        self.beta_start = beta_start
+        self.beta_end = beta_end
+        self.betas = torch.linspace(beta_start, beta_end, n_timesteps)
+        self.alphas = 1.0 - self.betas
+        self.alpha_hats = torch.cumprod(self.alphas, dim=0)
+
+    def get_betas(self):
+        return self.betas
+
+    def get_alphas(self):
+        return self.alphas
+
+    def get_alpha_hats(self):
+        return self.alpha_hats
 
 
 class TemporalTransformer(nn.Module):
